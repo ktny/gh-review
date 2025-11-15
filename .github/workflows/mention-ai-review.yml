@@ -1,0 +1,190 @@
+name: AI Mention Review
+
+on:
+  issue_comment:
+    types:
+      - created
+  pull_request_review_comment:
+    types:
+      - created
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-mention-${{ github.event.comment.id || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  AI_BOT_HANDLE: '@ai-review'
+
+jobs:
+  mention:
+    runs-on: ubuntu-latest
+    steps:
+      - name: トリガー判定
+        id: filter
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const core = require('@actions/core');
+            const comment = context.payload.comment || {};
+            const handle = (process.env.AI_BOT_HANDLE || '').toLowerCase().replace(/^@/, '');
+            const rawBody = (comment.body || '').trim();
+            const normalized = rawBody.toLowerCase();
+            const triggerPhrases = [
+              `@${handle}`,
+              `/ai `,
+              `/ai-review`,
+            ];
+            const triggered = triggerPhrases.some((token) => normalized.includes(token.trim()));
+            const issue = context.payload.issue;
+            const pull = context.payload.pull_request;
+            const hasPrContext = Boolean((issue && issue.pull_request) || pull);
+            if (!triggered || !hasPrContext) {
+              core.info('AI mention review not triggered.');
+              core.setOutput('run', 'false');
+              return;
+            }
+            const pullNumber = issue ? issue.number : pull.number;
+            core.setOutput('run', 'true');
+            core.setOutput('pull_number', String(pullNumber));
+            core.setOutput('request_body', rawBody);
+            core.setOutput('comment_author', comment.user?.login || '');
+            core.setOutput('comment_url', comment.html_url || '');
+            core.setOutput('comment_id', String(comment.id || ''));
+
+      - name: チェックアウト
+        if: ${{ steps.filter.outputs.run == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: プロンプト読込
+        if: ${{ steps.filter.outputs.run == 'true' }}
+        id: mention-prompts
+        run: |
+          {
+            echo 'system<<EOF'
+            cat .github/ai-prompts/system.md
+            echo 'EOF'
+            echo 'mention<<EOF'
+            cat .github/ai-prompts/mention-review.md
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: レビュー入力生成
+        if: ${{ steps.filter.outputs.run == 'true' }}
+        id: mention-context
+        uses: actions/github-script@v7
+        env:
+          PULL_NUMBER: ${{ steps.filter.outputs.pull_number }}
+          REQUEST_BODY: ${{ steps.filter.outputs.request_body }}
+          COMMENT_AUTHOR: ${{ steps.filter.outputs.comment_author }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number(process.env.PULL_NUMBER);
+            const prResponse = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
+            const pr = prResponse.data;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pullNumber,
+              per_page: 100,
+            });
+            const fileSummaries = files.map((file) => {
+              const delta = `+${file.additions}/-${file.deletions}`;
+              return `- ${file.filename} (${file.status}, ${delta})`;
+            });
+            const filesPreview = fileSummaries.slice(0, 40).join('\n');
+            const omittedCount = Math.max(files.length - 40, 0);
+            const diffResponse = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+              owner,
+              repo,
+              pull_number: pullNumber,
+              mediaType: { format: 'diff' },
+            });
+            const rawDiff = diffResponse.data || '';
+            const diffLimit = 8000;
+            const diffExcerpt = rawDiff.length > diffLimit
+              ? `${rawDiff.slice(0, diffLimit)}\n...diff truncated...`
+              : rawDiff;
+            const commentBody = process.env.REQUEST_BODY || '';
+            const requestHeader = [
+              `依頼コメント (${context.payload.comment?.html_url || 'N/A'}):`,
+              commentBody,
+              '',
+              `依頼者: ${process.env.COMMENT_AUTHOR || context.payload.comment?.user?.login || 'unknown'}`,
+            ].join('\n');
+            const meta = [
+              `PR #${pr.number}: ${pr.title}`,
+              `Author: ${pr.user.login}`,
+              `Base: ${pr.base.ref} -> Head: ${pr.head.ref}`,
+              `URL: ${pr.html_url}`,
+              `Commits: ${pr.commits}, Files: ${pr.changed_files}, +${pr.additions}/-${pr.deletions}`,
+            ].join('\n');
+            const summary = [
+              requestHeader,
+              '',
+              meta,
+              '',
+              'Changed files:',
+              filesPreview || '- (差分情報なし)',
+            ];
+            if (omittedCount > 0) {
+              summary.push(`...and ${omittedCount} more files omitted from the list above.`);
+            }
+            summary.push('', 'Diff excerpt:', diffExcerpt || '(diff unavailable)');
+            core.setOutput('input', summary.join('\n'));
+        with:
+          pull_number: ${{ steps.filter.outputs.pull_number }}
+          request_body: ${{ steps.filter.outputs.request_body }}
+          comment_author: ${{ steps.filter.outputs.comment_author }}
+
+      - name: AIレビュー実行
+        if: ${{ steps.filter.outputs.run == 'true' }}
+        id: mention-ai
+        uses: actions/ai-interface@v1
+        with:
+          model: github.gpt-4o-mini
+          system: ${{ steps.mention-prompts.outputs.system }}
+          instructions: ${{ steps.mention-prompts.outputs.mention }}
+          input: ${{ steps.mention-context.outputs.input }}
+
+      - name: コメント返信
+        if: ${{ steps.filter.outputs.run == 'true' && steps.mention-ai.outputs.response != '' }}
+        uses: actions/github-script@v7
+        env:
+          AI_RESPONSE: ${{ steps.mention-ai.outputs.response }}
+          COMMENT_AUTHOR: ${{ steps.filter.outputs.comment_author }}
+          REQUEST_BODY: ${{ steps.filter.outputs.request_body }}
+          PULL_NUMBER: ${{ steps.filter.outputs.pull_number }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number(process.env.PULL_NUMBER || context.payload.issue?.number || context.payload.pull_request?.number);
+            const commenter = process.env.COMMENT_AUTHOR || context.payload.comment?.user?.login || '';
+            const quotedRequest = (process.env.REQUEST_BODY || '')
+              .split('\n')
+              .map((line) => `> ${line}`)
+              .join('\n');
+            const bodyLines = [
+              `@${commenter || 'reviewer'} さんからのリクエストに対する回答です。`,
+              '',
+              quotedRequest,
+              '',
+              '---',
+              '',
+              process.env.AI_RESPONSE,
+            ];
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pullNumber,
+              body: bodyLines.join('\n'),
+            });
