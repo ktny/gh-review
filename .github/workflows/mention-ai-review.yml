@@ -67,10 +67,10 @@ jobs:
         run: |
           {
             echo 'system<<EOF'
-            cat .github/ai-prompts/system.md
+            cat .github/prompts/system.md
             echo 'EOF'
             echo 'mention<<EOF'
-            cat .github/ai-prompts/mention-review.md
+            cat .github/prompts/mention-review.md
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 

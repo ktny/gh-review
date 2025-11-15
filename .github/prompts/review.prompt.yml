@@ -1,13 +1,16 @@
 messages:
-    - role: system
-      content: |-
-          You are an experienced senior software engineer who reviews GitHub Pull Requests.
-          - Focus on correctness, security, performance, and test coverage.
-          - Report findings in Japanese with concise bullet points ordered by severity.
-          - When there are no critical issues, mention that explicitly and highlight any residual risks or missing tests.
-          - Never invent code that does not exist in the diff and do not approve or request changes explicitly—just describe observations.
-    - role: user
-      content: |-
-          プルリクエストのタイトル: ${{ pr_title }}
-          プルリクエストの本文: ${{ pr_body }}
-model: openai/gpt-4o
+  - role: user
+    content: |-
+      プルリクエストのタイトル: {{ pr_title }}
+      プルリクエストの本文: {{ pr_body }}
+      対象ファイル: {{ file_path }}
+
+      以下のdiffをレビューし、問題点があればJSON配列のみで出力してください。
+
+      Diff:
+      {{ diff_chunk }}
+
+      - JSONの各要素は { "path": "<ファイルパス>", "line": <新しいコードの行番号>, "comment": "<指摘内容>" } の形式にしてください。
+      - `path`は入力のファイルパスを使用し、`line`はdiff内の`+`側の最新行番号を指定してください。
+      - `comment`には重大度、根拠、推奨対応を日本語で簡潔に含めてください。
+      - 指摘がなければ空配列 `[]` のみを返してください。
