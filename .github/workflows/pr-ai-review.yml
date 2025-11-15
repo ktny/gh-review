@@ -1,134 +1,36 @@
 name: AI PR Review
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
-
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-
-concurrency:
-  group: ai-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+    pull_request:
+        types: [opened, synchronize, reopened]
 
 jobs:
-  review:
-    if: ${{ !github.event.pull_request.draft && !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: チェックアウト
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    inference:
+        permissions:
+            models: read
+            contents: read
+            pull-requests: write
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
 
-      - name: プロンプト読込
-        id: prompts
-        run: |
-          {
-            echo 'system<<EOF'
-            cat .github/ai-prompts/system.md
-            echo 'EOF'
-            echo 'pr_review<<EOF'
-            cat .github/ai-prompts/pr-review.md
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+            - name: AI Review
+              id: inference
+              uses: actions/ai-inference@v1
+              with:
+                  prompt-file: "./.github/prompts/review.prompt.yml"
+                  input: |
+                      pr_title: ${{ github.event.pull_request.title }}
+                      pr_body: ${{ github.event.pull_request.body }}
+                  max-tokens: 800
 
-      - name: レビュー入力生成
-        id: context
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const core = require('@actions/core');
-            const pr = context.payload.pull_request;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner,
-              repo,
-              pull_number: pr.number,
-              per_page: 100,
-            });
-            const fileSummaries = files.map((file) => {
-              const delta = `+${file.additions}/-${file.deletions}`;
-              return `- ${file.filename} (${file.status}, ${delta})`;
-            });
-            const filesPreview = fileSummaries.slice(0, 40).join('\n');
-            const omittedCount = Math.max(files.length - 40, 0);
-            const diffResponse = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-              owner,
-              repo,
-              pull_number: pr.number,
-              mediaType: { format: 'diff' },
-            });
-            const rawDiff = diffResponse.data || '';
-            const diffLimit = 12000;
-            const diffExcerpt = rawDiff.length > diffLimit
-              ? `${rawDiff.slice(0, diffLimit)}\n...diff truncated...`
-              : rawDiff;
-            const meta = [
-              `PR #${pr.number}: ${pr.title}`,
-              `Author: ${pr.user.login}`,
-              `Base: ${pr.base.ref} -> Head: ${pr.head.ref}`,
-              `URL: ${pr.html_url}`,
-              `Commits: ${pr.commits}, Files: ${pr.changed_files}, Additions/Deletions: +${pr.additions}/-${pr.deletions}`,
-              `Labels: ${(pr.labels || []).map((label) => label.name).join(', ') || 'なし'}`,
-            ].join('\n');
-            const summary = [
-              meta,
-              '',
-              'Changed files:',
-              filesPreview || '- (差分情報なし)',
-            ];
-            if (omittedCount > 0) {
-              summary.push(`...and ${omittedCount} more files omitted from the list above.`);
-            }
-            summary.push('', 'Diff excerpt:', diffExcerpt || '(diff unavailable)');
-            const reviewInput = summary.join('\n');
-            core.setOutput('input', reviewInput);
-
-      - name: AIレビュー実行
-        id: ai_review
-        uses: actions/ai-interface@v1
-        with:
-          model: github.gpt-4o-mini
-          system: ${{ steps.prompts.outputs.system }}
-          instructions: ${{ steps.prompts.outputs.pr_review }}
-          input: ${{ steps.context.outputs.input }}
-
-      - name: コメント投稿
-        if: ${{ steps.ai_review.outputs.response != '' }}
-        uses: actions/github-script@v7
-        env:
-          AI_RESPONSE: ${{ steps.ai_review.outputs.response }}
-        with:
-          script: |
-            const existingComments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              per_page: 100,
-            });
-            const marker = '<!-- ai-pr-review -->';
-            const body = `${marker}\n### 🤖 AI Review\n\n${process.env.AI_RESPONSE}`;
-            const previous = existingComments.find((comment) => comment.body && comment.body.includes(marker));
-            if (previous) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: previous.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body,
-              });
-            }
+            - name: Comment on PR
+              env:
+                  RESPONSE: ${{ steps.inference.outputs.response }}
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  echo "$RESPONSE" > comment.txt
+                  gh pr comment ${{ github.event.pull_request.number }} --body-file comment.txt

@@ -29,7 +29,6 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const core = require('@actions/core');
             const comment = context.payload.comment || {};
             const handle = (process.env.AI_BOT_HANDLE || '').toLowerCase().replace(/^@/, '');
             const rawBody = (comment.body || '').trim();
@@ -83,6 +82,7 @@ jobs:
           PULL_NUMBER: ${{ steps.filter.outputs.pull_number }}
           REQUEST_BODY: ${{ steps.filter.outputs.request_body }}
           COMMENT_AUTHOR: ${{ steps.filter.outputs.comment_author }}
+          MENTION_INSTRUCTIONS: ${{ steps.mention-prompts.outputs.mention }}
         with:
           script: |
             const owner = context.repo.owner;
@@ -139,21 +139,25 @@ jobs:
               summary.push(`...and ${omittedCount} more files omitted from the list above.`);
             }
             summary.push('', 'Diff excerpt:', diffExcerpt || '(diff unavailable)');
-            core.setOutput('input', summary.join('\n'));
-        with:
-          pull_number: ${{ steps.filter.outputs.pull_number }}
-          request_body: ${{ steps.filter.outputs.request_body }}
-          comment_author: ${{ steps.filter.outputs.comment_author }}
+            const reviewInput = summary.join('\n');
+            const instructions = process.env.MENTION_INSTRUCTIONS || '';
+            const prompt = [
+              instructions,
+              '',
+              '--- INPUT ---',
+              reviewInput,
+            ].join('\n');
+            core.setOutput('prompt', prompt);
 
       - name: AIレビュー実行
         if: ${{ steps.filter.outputs.run == 'true' }}
         id: mention-ai
-        uses: actions/ai-interface@v1
+        uses: actions/ai-inference@v1
         with:
           model: github.gpt-4o-mini
-          system: ${{ steps.mention-prompts.outputs.system }}
-          instructions: ${{ steps.mention-prompts.outputs.mention }}
-          input: ${{ steps.mention-context.outputs.input }}
+          system-prompt: ${{ steps.mention-prompts.outputs.system }}
+          prompt: ${{ steps.mention-context.outputs.prompt }}
+          max-tokens: 800
 
       - name: コメント返信
         if: ${{ steps.filter.outputs.run == 'true' && steps.mention-ai.outputs.response != '' }}
