@@ -1,36 +1,184 @@
 name: AI PR Review
 
 on:
-    pull_request:
-        types: [opened, synchronize, reopened]
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
 
 jobs:
-    inference:
-        permissions:
-            models: read
-            contents: read
-            pull-requests: write
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
-              with:
-                  fetch-depth: 0
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.chunks.outputs.matrix }}
+      has_chunks: ${{ steps.chunks.outputs.has_chunks }}
+      pr_number: ${{ steps.meta.outputs.pr_number }}
+      pr_title: ${{ steps.meta.outputs.pr_title }}
+      pr_body: ${{ steps.meta.outputs.pr_body }}
+      head_sha: ${{ steps.meta.outputs.head_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-            - name: AI Review
-              id: inference
-              uses: actions/ai-inference@v1
-              with:
-                  prompt-file: "./.github/prompts/review.prompt.yml"
-                  input: |
-                      pr_title: ${{ github.event.pull_request.title }}
-                      pr_body: ${{ github.event.pull_request.body }}
-                  max-tokens: 800
+      - name: Collect PR metadata
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('pr_title', pr.title || '');
+            core.setOutput('pr_body', pr.body || '');
+            core.setOutput('head_sha', pr.head.sha);
 
-            - name: Comment on PR
-              env:
-                  RESPONSE: ${{ steps.inference.outputs.response }}
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              run: |
-                  echo "$RESPONSE" > comment.txt
-                  gh pr comment ${{ github.event.pull_request.number }} --body-file comment.txt
+      - name: Build diff chunks
+        id: chunks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            const chunkLimit = 6000;
+            const encode = (text) => Buffer.from(text, 'utf8').toString('base64');
+            const chunks = [];
+            let chunkId = 0;
+            const flushBuffer = (state) => {
+              if (state.buffer.length <= 1) {
+                state.buffer = [`File: ${state.filename}`];
+                state.length = state.buffer[0].length;
+                return;
+              }
+              const content = state.buffer.join('\n');
+              chunks.push({
+                id: `chunk-${chunkId++}`,
+                filename: state.filename,
+                diff: encode(content),
+              });
+              state.buffer = [`File: ${state.filename}`];
+              state.length = state.buffer[0].length;
+            };
+            for (const file of files) {
+              if (!file.patch) {
+                continue;
+              }
+              const hunkRegex = /@@[\s\S]*?(?=@@|$)/g;
+              const hunks = file.patch.match(hunkRegex) || [file.patch];
+              const state = {
+                filename: file.filename,
+                buffer: [`File: ${file.filename}`],
+                length: `File: ${file.filename}`.length,
+              };
+              for (const rawHunk of hunks) {
+                const hunk = rawHunk.trimEnd();
+                if (!hunk) {
+                  continue;
+                }
+                if (state.length + hunk.length + 1 > chunkLimit) {
+                  flushBuffer(state);
+                }
+                state.buffer.push(hunk);
+                state.length += hunk.length + 1;
+              }
+              flushBuffer(state);
+            }
+            core.setOutput('matrix', JSON.stringify(chunks));
+            core.setOutput('has_chunks', chunks.length > 0 ? 'true' : 'false');
+
+  review:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.has_chunks == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      models: read
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Restore diff chunk
+        run: |
+          echo "${{ matrix.chunk.diff }}" | base64 -d > chunk.diff
+
+      - name: AIレビュー実行
+        id: ai
+        uses: actions/ai-inference@v1
+        with:
+          model: github.gpt-4o-mini
+          system-prompt-file: .github/prompts/system.md
+          prompt-file: .github/prompts/review.prompt.yml
+          input: |
+            pr_title: >-
+              ${{ needs.prepare.outputs.pr_title }}
+            pr_body: >-
+              ${{ needs.prepare.outputs.pr_body }}
+            file_path: >-
+              ${{ matrix.chunk.filename }}
+          file_input: |
+            diff_chunk: chunk.diff
+          max-tokens: 800
+
+      - name: レビューコメント投稿
+        if: ${{ steps.ai.outputs.response != '' }}
+        uses: actions/github-script@v7
+        env:
+          AI_RESPONSE: ${{ steps.ai.outputs.response }}
+          DEFAULT_PATH: ${{ matrix.chunk.filename }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+        with:
+          script: |
+            const responseText = process.env.AI_RESPONSE.trim();
+            let parsed;
+            try {
+              parsed = JSON.parse(responseText);
+            } catch (error) {
+              core.warning(`Failed to parse AI response as JSON: ${error.message}`);
+              return;
+            }
+            if (!Array.isArray(parsed) || parsed.length === 0) {
+              core.info('No inline comments to create.');
+              return;
+            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = Number(process.env.PR_NUMBER);
+            const commit_id = process.env.HEAD_SHA;
+            for (const entry of parsed) {
+              const body = entry.comment || entry.body || entry.message;
+              const path = entry.path || entry.file || process.env.DEFAULT_PATH;
+              const line = entry.line || entry.lineNumber;
+              if (!body || !line || !path) {
+                core.info('Skipping entry because path/line/body is missing.');
+                continue;
+              }
+              try {
+                await github.rest.pulls.createReviewComment({
+                  owner,
+                  repo,
+                  pull_number,
+                  commit_id,
+                  path,
+                  line: Number(line),
+                  side: 'RIGHT',
+                  body,
+                });
+              } catch (error) {
+                core.warning(`Failed to create comment for ${path}:${line} - ${error.message}`);
+              }
+            }
