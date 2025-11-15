@@ -2,24 +2,35 @@ name: AI PR Review
 
 on:
     pull_request:
-        types:
-            - opened
-            - synchronize
-            - reopened
-            - ready_for_review
+        types: [opened, synchronize, reopened]
 
 jobs:
     inference:
         permissions:
             models: read
+            contents: read
+            pull-requests: write
         runs-on: ubuntu-latest
         steps:
-            - name: Test Local Action
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: AI Review
               id: inference
               uses: actions/ai-inference@v1
               with:
-                  prompt: "Hello!"
+                  prompt-file: "./.github/prompts/review.prompt.yml"
+                  input: |
+                      pr_title: ${{ github.event.pull_request.title }}
+                      pr_body: ${{ github.event.pull_request.body }}
+                  max-tokens: 800
 
-            - name: Print Output
-              id: output
-              run: echo "${{ steps.inference.outputs.response }}"
+            - name: Comment on PR
+              env:
+                  RESPONSE: ${{ steps.inference.outputs.response }}
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  echo "$RESPONSE" > comment.txt
+                  gh pr comment ${{ github.event.pull_request.number }} --body-file comment.txt

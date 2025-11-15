@@ -157,6 +157,7 @@ jobs:
           model: github.gpt-4o-mini
           system-prompt: ${{ steps.mention-prompts.outputs.system }}
           prompt: ${{ steps.mention-context.outputs.prompt }}
+          max-tokens: 800
 
       - name: コメント返信
         if: ${{ steps.filter.outputs.run == 'true' && steps.mention-ai.outputs.response != '' }}
